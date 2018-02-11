@@ -59,6 +59,7 @@ tf.app.flags.DEFINE_integer ('iters_per_worker', 1,           'number of train o
 # ================
 
 tf.app.flags.DEFINE_boolean ('train',            True,        'wether to train the network')
+tf.app.flags.DEFINE_boolean ('train_fp16',       False,       'Train in FP16 mode')
 tf.app.flags.DEFINE_boolean ('test',             True,        'wether to test the network')
 tf.app.flags.DEFINE_integer ('epoch',            100,         'target epoch to train - if negative, the absolute number of additional epochs will be trained')
 
@@ -372,7 +373,7 @@ def log_error(message):
 # Graph Creation
 # ==============
 
-def variable_on_worker_level(name, shape, initializer, trainable=True, regularizer=None):
+def variable_on_worker_level(name, shape, initializer, trainable=True, regularizer=None, dtype=None):
     r'''
     an utility function ``variable_on_worker_level() to create a variable in CPU memory.
     '''
@@ -385,7 +386,7 @@ def variable_on_worker_level(name, shape, initializer, trainable=True, regulariz
     with tf.device(device):
         # Create or get apropos variable
         var = tf.get_variable(name=name, shape=shape, initializer=initializer, trainable=trainable,
-                              regularizer=regularizer)
+                              regularizer=regularizer, dtype=None)
     return var
 
 '''
@@ -435,18 +436,21 @@ class CustomRNNCell2(tf.contrib.rnn.BasicRNNCell):
 
 def batch_norm(name,
                input,
-               training = True):
+               training = True,
+               dtype=None):
     n_channels = input.get_shape()[-1]
     bn_momentum = 0.95
     bn_epsilon = 0.001
     beta = variable_on_worker_level(name + '/beta',  shape=[n_channels],
                    initializer=tf.zeros_initializer,
                    trainable=True,
-                   regularizer=tf.contrib.layers.l2_regularizer(weight_decay) if (weight_decay > 0.0) else None)
+                   regularizer=tf.contrib.layers.l2_regularizer(weight_decay) if (weight_decay > 0.0) else None,
+                   dtype=dtype)
     gamma = variable_on_worker_level(name + '/gamma',  shape=[n_channels],
                    initializer=tf.ones_initializer,
                    trainable=True,
-                   regularizer=tf.contrib.layers.l2_regularizer(weight_decay) if (weight_decay > 0.0) else None)
+                   regularizer=tf.contrib.layers.l2_regularizer(weight_decay) if (weight_decay > 0.0) else None,
+                   dtype=dtype)
     batch_mean, batch_var = tf.nn.moments(input, [0, 1, 2])
     normed = tf.nn.batch_normalization(input, batch_mean, batch_var, beta, gamma, bn_epsilon)
 
@@ -485,18 +489,21 @@ def conv2D(name,
            activation_fn=lambda x: tf.minimum(tf.nn.relu(x), FLAGS.relu_clip),
            weights_initializer=tf.contrib.layers.xavier_initializer(uniform=False),
            bias_initializer=tf.zeros_initializer(),
-           training = True
+           training = True,
+           dtype=None
            ):
     #filter_shape= [kernel_size[0], kernel_size[1], in_channels, output_channels]
     w = variable_on_worker_level(name+'/w',
                    shape = [kernel_size[0], kernel_size[1], in_channels, output_channels],
                    initializer=weights_initializer, trainable=True,
-                   regularizer=tf.contrib.layers.l2_regularizer(weight_decay) if (weight_decay > 0.) else None)
+                   regularizer=tf.contrib.layers.l2_regularizer(weight_decay) if (weight_decay > 0.) else None,
+                   dtype=dtype)
 
     b = variable_on_worker_level(name+'/b',
                    shape=[output_channels],
                    initializer=bias_initializer, trainable=True,
-                   regularizer=tf.contrib.layers.l2_regularizer(weight_decay) if (weight_decay > 0.) else None)
+                   regularizer=tf.contrib.layers.l2_regularizer(weight_decay) if (weight_decay > 0.) else None,
+                   dtype=dtype)
 
     s = [1, strides[0], strides[1], 1]
     y = tf.nn.conv2d(input, w, s, padding)
@@ -506,8 +513,8 @@ def conv2D(name,
     return output
 
 # =========================================================
-
-def rnn_cell(rnn_cell_dim = 1024, layer_type="gru", dropout=1.0):
+# TODO(akiswani): dtype
+def rnn_cell(rnn_cell_dim = 1024, layer_type="gru", dropout=1.0, dtype=None):
     if (layer_type=="lstm"):
         cell = tf.contrib.rnn.BasicLSTMCell(rnn_cell_dim, forget_bias=1.0, state_is_tuple=True) \
                        if 'reuse' not in inspect.getargspec(tf.contrib.rnn.BasicLSTMCell.__init__).args else \
@@ -541,6 +548,8 @@ def DeepSpeech2(batch_x, seq_length,training):
     r'''
     DeepSpeech2-like model https://arxiv.org/pdf/1512.02595.pdf
     '''
+
+    dtype = tf.float16 if FLAGS.train_fp16 else None
 
     dropout = FLAGS.dropout if training else 1.0
 
@@ -600,7 +609,9 @@ def DeepSpeech2(batch_x, seq_length,training):
                    # activation_fn=tf.nn.relu,
                    weights_initializer=tf.contrib.layers.xavier_initializer(uniform=False),
                    bias_initializer=tf.constant_initializer(0.000001),
-                   training=training)
+                   training=training,
+                   dtype=dtype
+                   )
     
     # transpose to [T,B,F,C] format
     conv =  tf.transpose(conv, [1, 0, 2, 3])
@@ -617,9 +628,9 @@ def DeepSpeech2(batch_x, seq_length,training):
         rnn_input = outputs
         rnn_cell_dim = int(FLAGS.rnn_cell_dim)
         multirnn_cell_fw = tf.contrib.rnn.MultiRNNCell(
-            [rnn_cell(rnn_cell_dim=rnn_cell_dim, layer_type=FLAGS.rnn_type, dropout=dropout) for _ in range(num_rnn_layers)])
+            [rnn_cell(rnn_cell_dim=rnn_cell_dim, layer_type=FLAGS.rnn_type, dropout=dropout, dtype=dtype) for _ in range(num_rnn_layers)])
         multirnn_cell_bw = tf.contrib.rnn.MultiRNNCell(
-            [rnn_cell(rnn_cell_dim=rnn_cell_dim, layer_type=FLAGS.rnn_type, dropout=dropout) for _ in range(num_rnn_layers)])
+            [rnn_cell(rnn_cell_dim=rnn_cell_dim, layer_type=FLAGS.rnn_type, dropout=dropout, dtype=dtype) for _ in range(num_rnn_layers)])
         outputs,output_states = tf.nn.bidirectional_dynamic_rnn(cell_fw = multirnn_cell_fw,
                    cell_bw = multirnn_cell_bw,
                    inputs=rnn_input,
